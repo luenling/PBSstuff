@@ -5,7 +5,7 @@
 # takes a vcf file adds snpeff annotations for lcmv and creates output tables
 #--------------
 BASEDIR=/Volumes/Temp/Lukas/LCMV_project
-REFGENOME=$BASEDIR/References/viruses.fasta
+REFGENOME=$BASEDIR/References/viruses_short.fasta
 PICARD=/usr/local/Cellar/picard-tools/1.128/share/java/picard.jar
 GATK=/Volumes/Temp/Lukas/LCMV_project/Tools/GenomeAnalysisTK-3.4-46.jar
 SAMTOOLS=/usr/local/bin/samtools
@@ -27,5 +27,5 @@ bcftools query -Hf "%CHROM\t%POS\t%REF\t%ALT\t%TYPE\t%MQMR\t%MQM\t%FSB\t%SB[\t%D
 bcftools query -Hf "%CHROM\t%POS\t%REF\t%ALT\t%TYPE[\t%DP][\t%AF]\n"  $1 > ${FN}.afs.tab
 python ${BASEDIR}/Scripts/get_positions_from_sync.py -a ${FN}.afs.tab -b ${FN}_snpeff.tab --both | cat <(head -1  ${FN}.afs.tab )  -  >  ${FN}.afs.anno.tab
 
-sed 's/BSF_0176_//g; s/_trimmed//g; s/gi\|86440167\|gb\|DQ361066\.1\|/L/g; s/gi\|116563461\|gb\|DQ361065.2\|/S/g; s/DQ361065\.7/NP/g; s/DQ361065\.4/GP/g; s/DQ361066\.4/geneZ/g ; s/DQ361066\.7/geneL/g; s/\[[0-9]*\]//g' <  ${FN}.afs.anno.tab >  ${FN}.afs.anno_alt.tab
-sed 's/BSF_0176_//g; s/_trimmed//g; s/gi\|86440167\|gb\|DQ361066\.1\|/L/g; s/gi\|116563461\|gb\|DQ361065.2\|/S/g; s/DQ361065\.7/NP/g; s/DQ361065\.4/GP/g; s/DQ361066\.4/geneZ/g ; s/DQ361066\.7/geneL/g; s/\[[0-9]*\]//g' <  ${FN}.stats.tab >  ${FN}.stats_alt.tab
+sed 's/_S194[^:]*//g; s/_trimmed//g; s/gi\|86440167\|gb\|DQ361066\.1\|/L/g; s/gi\|116563461\|gb\|DQ361065.2\|/S/g; s/DQ361065\.7/NP/g; s/DQ361065\.4/GP/g; s/DQ361066\.4/geneZ/g ; s/DQ361066\.7/geneL/g; s/\[[0-9]*\]//g' <  ${FN}.afs.anno.tab >  ${FN}.afs.anno_alt.tab
+sed 's/_S194[^:]*//g; s/_trimmed//g; s/gi\|86440167\|gb\|DQ361066\.1\|/L/g; s/gi\|116563461\|gb\|DQ361065.2\|/S/g; s/DQ361065\.7/NP/g; s/DQ361065\.4/GP/g; s/DQ361066\.4/geneZ/g ; s/DQ361066\.7/geneL/g; s/\[[0-9]*\]//g' <  ${FN}.stats.tab >  ${FN}.stats_alt.tab

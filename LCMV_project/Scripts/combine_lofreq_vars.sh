@@ -2,7 +2,7 @@
 #----------
 # author: Lukas Endler
 # date: 20.9.2015 at 16:46
-# takes a bam file calls variants with freebayes
+# combines vcf files from lofreq and creates a bed for calling with
 #--------------
 BASEDIR=/Volumes/Temp/Lukas/LCMV_project
 REFGENOME=$BASEDIR/References/viruses_short.fasta

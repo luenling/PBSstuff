@@ -5,7 +5,7 @@
 # takes a vcf file adds snpeff annotations for lcmv and creates output tables
 #--------------
 BASEDIR=/Volumes/Temp/Lukas/LCMV_project
-REFGENOME=$BASEDIR/References/viruses.fasta
+REFGENOME=$BASEDIR/References/viruses_short.fasta
 PICARD=/usr/local/Cellar/picard-tools/1.128/share/java/picard.jar
 GATK=/Volumes/Temp/Lukas/LCMV_project/Tools/GenomeAnalysisTK-3.4-46.jar
 SAMTOOLS=/usr/local/bin/samtools
