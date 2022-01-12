@@ -1,0 +1,799 @@
+---
+title: "gerner_rnaseq_analysis"
+author: "Lukas Endler"
+created: "December 4, 2019"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,cache.comments=FALSE,autodep=TRUE)
+cache_most=TRUE
+cache_special=TRUE
+ERANAL = FALSE
+image.saving = FALSE
+```
+
+# Setup Analysis
+
+## Libraries and helper functions
+
+```{r libraries_helpers , results='hide', message=FALSE, warning=FALSE}
+library("limma")
+library("DT")
+library("Glimma")
+library("edgeR")
+library("DESeq2")
+library("ggplot2")
+library("RColorBrewer")
+library("reshape2")
+library("ggrepel")
+library("factoextra")
+library("pheatmap")
+library("corrplot")
+library("GGally")
+library("org.Mm.eg.db")
+library('variancePartition')
+library(ggpubr)
+library(doParallel)
+library(foreach)
+require(hexbin)
+require(gridExtra)
+library(biomaRt)
+library("EnrichmentBrowser")
+library(GSEABase)
+setwd("~/Data/Gerner_RNASeq/")
+source("rnaseq_funcs.R")
+```
+
+## Data loading and preprocessing
+
+### Count table preprocessing
+
+Load the count table and filter the genes using expression of more than 1cpm and 10 counts in at least 5 replicates:
+
+```{r prepare_sample_sheet_counts_annotations, cache=cache_most}
+# read the table
+wg <- read.table("~/vetlinux01_temp2/Lukas/Wilhelm/Mappings/fc_all_samples_red.tsv",header=T)
+# setup sample names and restrict count matrix
+samples=grep("^A[0-9]C[15]",names(wg),value=T)
+counts=wg[,samples]
+rownames(counts)=wg$Geneid
+samps=sub("_S.*","",samples,perl=T)
+colnames(counts)=samps
+
+# sample sheet
+conds=sub("A[0-9]","",samps)
+ind = sub("C[0-9]","",samps,perl=T)
+sample.sheet=data.frame(sample=samps,condition=conds, ind=ind)
+levels(sample.sheet$condition)=c("CD2+","CD2-")
+rownames(sample.sheet)=samps
+sample.sheet
+
+```
+
+### Create gene annotations sheet
+
+Either load already prepared annotation sheet or get annotations via biomart - takes quite a while (ca 2min)
+
+```{r create_annos_sheet, cache=cache_special}
+# get gene annotations
+if (file.exists("gene_annos.Rda")) {
+  load("gene_annos.Rda")
+} else {
+  genes=wg[,c("Geneid","Chr","Length")]
+  ensembl = useMart("ensembl", dataset = "sscrofa_gene_ensembl")
+  annos <- getBM(filters = "ensembl_gene_id", mart = ensembl, values = genes$Geneid, 
+                 attributes = c("ensembl_gene_id","gene_biotype","external_gene_name",
+                                "entrezgene_id","description"))
+  # some bad annotations with entrez, multiple entrez IDs :(
+  # only take first occurence of duplicated ensemble IDS 
+  annos <- annos[!duplicated(annos$ensembl_gene_id),]
+  #all(genes$Geneid == gene_annos$Geneid)
+  gene_annos = merge(genes,annos,by.x="Geneid",by.y="ensembl_gene_id")
+  rownames(gene_annos)=gene_annos$Geneid
+  gene_annos = gene_annos[genes$Geneid,]
+  # get useful chromosome names
+  gene_annos$Chr=as.factor(sapply(strsplit(as.character(gene_annos$Chr),";"),`[[`,1))
+  save(gene_annos,file="gene_annos.Rda")
+}
+for(i in c("gene_biotype","external_gene_name","entrezgene_id","description")){
+  gene_annos[,i] = as.factor(gene_annos[,i])
+}
+
+```
+
+### Create the EdgeR/Limma DGEList object 
+
+
+```{r create_DGEList, cache=cache_most}
+wg_dge=DGEList(counts=counts,genes = gene_annos)
+wg_dge$samples=data.frame(wg_dge$samples,sample.sheet)
+wg_dge$samples$group=wg_dge$samples$condition
+wg_dge$samples$replicates=sapply(1:length(wg_dge$samples$group), function(x) sum(wg_dge$samples$group[1:x] == wg_dge$samples$group[x]))
+wg_dge = calcNormFactors(wg_dge,method = "TMM")
+wg_dge$samples
+```
+
+# Quality control plots
+
+## QC of sequencing reads
+
+[FASTQC via MultiQC](./QC/FASTQC_multiqc_report.html)
+
+## QC of mapped reads
+
+[ Qualimap, featureCounts and STAR via MultiQC](./QC/FASTQC_multiqc_report.html)
+
+
+# Diagnostic Plots
+
+## Overall count plots
+
+```{r overall_counts_1, warning=FALSE, fig.cap="unfiltered counts for all genes", cache=cache_most}
+plot_overall_counts(wg_dge,which_plots = "first")
+
+```
+```{r overall_counts_2, warning=FALSE, fig.cap="Density of log10 unfiltered counts for all genes", cache=cache_most}
+plot_overall_counts(wg_dge,which_plots = "second")
+```
+
+```{r low_expressed_genes_1, warning=FALSE, fig.cap="Genes below threshold", cache=cache_most}
+plot_filtered_genes(wg_dge,use.cpm = FALSE, minval = c(5,10,25,50,100), gen_above_threshold = TRUE, n=4, add_kept_gene_frac = TRUE)
+```
+
+```{r low_expressed_genes_2, warning=FALSE, fig.cap="Unexpressed genes", cache=cache_most}
+plot_filtered_genes(wg_dge, minval = c(5,10,25,50,100), n=4,use.cpm = FALSE)
+```
+
+## Biological coefficient of variation
+
+Biological coefficient of variation (BCV) is explained in chapt. 2.8.2 of the [EdgeR User's guide](https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf).   
+
+The BCV should correspond to the variation between replicates that is not just due to poisson sampling - that is additional biological and technical variation. A value of eg. 0.25 means something like that the estimated true abundance of a gene varies by 25% between replicates.
+from [Chen et al., F1000Research 2016, 5:1438](http://dx.doi.org/10.12688/f1000research.8987.2):
+*For RNA-seq studies, the NB dispersions tend to be higher for genes with very low counts. The dispersion trend tends to decrease smoothly with abundance and to asymptotic to a constant value for genes with larger counts. From our past  experience, the asymptotic value for the BCV tends to be in range from 0.05 to 0.2 for genetically identical mice or cell lines, whereas somewhat larger values (> 0.3) are observed for human subjects.*
+
+```{r bcv_plot, warning=FALSE, fig.cap="BCV plot", cache=cache_most}
+design_edger=model.matrix(~ condition,data=wg_dge$samples)
+wg_dge_disp=estimateDisp(wg_dge,design=design_edger)
+plotBCV(wg_dge_disp)
+```
+
+
+## Filter genes by minimum expression
+
+```{r filter_genes, warning=FALSE, cache=cache_most}
+# filter out lowly expressed, maybe better not to use the conditions as a criterium to avoid biases?
+keep=check_expression_threshold(wg_dge,min_cpm=1.0,min_count=10,n=4)
+wg_filt=wg_dge[keep,  , keep.lib.sizes = FALSE]
+wg_filt =  calcNormFactors(wg_filt, method = "TMM")
+table(keep)
+```
+
+After filtering `r signif(sum(keep)/length(keep)*100,digits=2)`% of the `r length(keep)` genes are kept. 
+
+```{r, warning=FALSE,message=FALSE, cache=cache_most}
+design_edger=model.matrix(~ condition+ind,data=wg_filt$samples)
+wg_filt_disp=estimateDisp(wg_filt,design=design_edger)
+plotBCV(wg_filt_disp)
+plot_overall_counts(wg_filt)
+plot_MA_matrix(wg_filt,averageover = "group")
+```
+
+## MDS plot
+
+from [Chen et al., F1000Research 2016, 5:1438](http://dx.doi.org/10.12688/f1000research.8987.2):
+*In the MDS plot, the distance between each pair of samples can be interpreted as the leading log-fold change between the samples for the genes that best distinguish that pair of samples. By default, leading fold-change is defined as the root-mean-square of the largest 500 log2-fold changes between that pair of samples. In this plots, replicates should be closer to each other, than unrelated samples*
+
+```{r mds_plot, warning=FALSE,message=FALSE,fig.cap="MDS plot using the top=500 and gene.selection=\"pairwise\" options of limma::plotMDS", cache=cache_most}
+mds=niceMDS(wg_filt,color_by = "condition",shape_by = "ind",lables = "sample")
+```
+
+```{r Glimma_plot_MDS, , cache=cache_most}
+glMDSPlot(wg_filt,groups=wg_filt$samples$condition,labels = wg_filt$samples$sample,html = "wg_filt_mds.html",launch = FALSE)
+```
+
+[Interactive MDS plot](./glimma-plots/wg_filt_mds.html.html)
+
+## PCA plot
+
+```{r pca_plot, warning=FALSE,message=FALSE,fig.cap="PCA of the 5000 most variable genes", cache=cache_most}
+pca_plot=nicePCA(wg_filt,color_by = "condition",shape_by = "ind",lables = "sample",topvar = 5000)
+```
+
+```{r pca_plot_2, warning=FALSE,message=FALSE,fig.cap="PC3 and 4", cache=cache_most}
+pca_plot=nicePCA(pca_plot,annos = wg_filt$samples,color_by = "condition",shape_by = "ind",lables = "sample",xdim="PC3",ydim="PC4")
+```
+
+Correlation of the PCs with the different categories (condition and individuals). 
+p_lm: P value anova
+adj.r2: R^2 value of the LM
+p_krusk: Kruskal Test P value 
+
+```{r PCA_correlation,warning=FALSE,message=FALSE, cache=cache_most}
+r2_corPC = get_r2_corPC(pca_plot,annos = wg_filt$samples[,c("condition","ind")])
+r2_corPC <- lapply(r2_corPC,signif, digits=3)
+for (x in names(r2_corPC)) { colnames(r2_corPC[[x]]) <- paste(x,colnames(r2_corPC[[x]]),sep=".")  } 
+r2_corPC <- cbind(r2_corPC$condition,r2_corPC$ind)
+ knitr::kable(r2_corPC,col.names = c('P(lin. model)', 'adj. R2', 'P (H Test)', 'P(lin. model)', 'adj. R2', 'P (H Test)'),
+              format="html",caption = "Correlation between Princ. Comps. and condition and individual ID") %>%
+  kableExtra::kable_styling("striped", full_width = F) %>% 
+  kableExtra::add_header_above(c("PC", "CD2+/-"=3, "Individual" = 3))
+
+```
+
+## PCA plot including Pooled Samples
+
+```{r pca_plot_all, warning=FALSE,message=FALSE,fig.cap="PCA of the 5000 most variable genes", cache=cache_most}
+samples=grep("Pool.[1,2,4,5,6,8]",colnames(wg),value = T)
+pools = wg[wg$Geneid %in% rownames(wg_filt$counts) , c("Geneid",samples)]
+rownames(pools) = pools$Geneid
+pools$Geneid = NULL
+colnames(pools) = sub("_S.*","",samples,perl=T)
+pools = pools[rownames(wg_filt$counts),]
+ssheet_all = data.frame(sample=colnames(pools),condition=c("pCD2+","pCD2+,med","pCD2+,PMA","pCD2-","pCD2-,med","pCD2-,PMA"),ind="pool")
+ssheet_all=rbind(sample.sheet,ssheet_all) 
+# create the final 
+wg_all= cbind(wg_filt$counts,pools)
+wg_all = DGEList(wg_all,samples = ssheet_all, genes = wg_filt$genes)
+wg_all = calcNormFactors(wg_all)
+wg_all$samples$group = wg_all$samples$condition
+pca_plot=nicePCA(wg_all,color_by = "condition",shape_by = "ind",lables = "sample",topvar = 5000)
+```
+
+# DE Analysis Variants
+
+## EdgeR Analysis
+
+
+```{r model_full,warning=FALSE,message=FALSE, cache=cache_most}
+design_edger=model.matrix(~ condition + ind,data=wg_filt$samples)
+wg_filt_disp=estimateDisp(wg_filt,design=design_edger)
+wg_e1 <- glmFit(wg_filt_disp,design=design_edger)
+lrt_e1 <- glmLRT(wg_e1,coef="conditionCD2-")
+wg_e1_QL <- glmQLFit(wg_filt_disp,design=design_edger,robust = TRUE)
+plotQLDisp(wg_e1_QL,main="4th Root of the QL Dispersion estimates, full model")
+#summary(wg_e1_QL$df.prior)
+hist(wg_e1_QL$df.prior,main="QL prior degrees of freedom,full model")
+ql_lrt <- glmQLFTest(wg_e1_QL,coef="conditionCD2-")
+```
+
+
+Compare P values of LRT and QL LRT for the full model.
+```{r compare_lrt_ql_lrt,warning=FALSE,message=FALSE,fig.cap="Comparison of LRT and QL LRT P values for the full model", cache=cache_most}
+plotCompareP_alt(lrt_e1$table$PValue,ql_lrt$table$PValue,xlab="lrt P, full",ylab="QL lrt P",title="Full model, EdgeR")
+```
+
+LRT seems to be messed up, maybe the low variance of genes all zero for one condition.
+
+```{r Glimma_plot_lrt_ql_lrt, cache=cache_most}
+glXYPlot(-log10(lrt_e1$table$PValue), -log10(ql_lrt$table$PValue), ylab = "-log10(P) QL lrt", xlab = "-log10(P) QL lrt",
+         counts=cpm(wg_filt), transform = F,groups = wg_filt$samples$group, anno=wg_filt$genes[,c(1,4,5,6)], side.main = "Geneid", side.ylab = "CPM (TMM norm)", launch=FALSE,html = "wg_filt_lrt_ql_lrt.html" )
+```
+
+[Dynamic version of this plot](./glimma-plots/wg_filt_lrt_ql_lrt.html.html)
+
+Try a model without individuals as a cofactor, only using condition. 
+
+```{r model_reduced,warning=FALSE,message=FALSE, include=TRUE, cache=cache_most}
+design_edger2=model.matrix(~ condition,data=wg_filt$samples)
+wg_filt_disp2=estimateDisp(wg_filt,design=design_edger2)
+#plotBCV(wg_filt_disp2)
+wg_e2_QL <- glmQLFit(wg_filt_disp2,design=design_edger2,robust = TRUE)
+plotQLDisp(wg_e2_QL,main="4th Root of the QL Dispersion estimates, condition only")
+hist(wg_e2_QL$df.prior,main="QL prior degrees of freedom,condition only")
+ql_lrt2 <- glmQLFTest(wg_e2_QL,coef="conditionCD2-")
+```
+
+Adding ind does not change much in the results either:
+
+```{r compare_full_reduced,warning=FALSE,message=FALSE, cache=cache_most}
+plotCompareP_alt(ql_lrt$table$PValue,ql_lrt2$table$PValue,xlab="ql lrt P, full",ylab="ql_lrt P, only cond")
+summary(decideTests(ql_lrt))
+summary(decideTests(ql_lrt2))
+```
+
+```{r Glimma_plot_full_red,cache=TRUE}
+glXYPlot(-log10(ql_lrt$table$PValue), -log10(ql_lrt2$table$PValue), ylab = "-log10(P) QL lrt reduced", xlab = "-log10(P) QL lrt full",
+         counts=cpm(wg_filt), transform = F,groups = wg_filt$samples$group, anno=wg_filt$genes[,c(1,4,5,6)], side.main = "Geneid", side.ylab = "CPM (TMM norm)", launch=FALSE,html = "wg_filt_full_red" )
+```
+
+[Dynamic version of this plot](./glimma-plots/wg_filt_full_red.html)
+
+
+## Limma Voom analysis
+
+Voom on reduced model for fitting and for duplicate correlation (run voom twice):
+
+```{r voom_dupcor,warning=FALSE,message=FALSE, cache=cache_most}
+design = model.matrix(~ condition,data=wg_filt$samples)
+wg_voom <- voom(wg_filt, design , plot = T)
+dupcor <- duplicateCorrelation(wg_voom,design,block=wg_filt$samples$ind) 
+wg_voom3 <- voom(wg_filt, design , block = wg_filt$samples$ind, correlation = dupcor$consensus , plot = T)
+# fit with duplicate correlation
+dupcor <- duplicateCorrelation(wg_voom3,design,block=wg_filt$samples$ind)
+fitDupCor = lmFit(wg_voom3,design,block = wg_filt$samples$ind, correlation = dupcor$consensus)
+fitDupCor = eBayes(fitDupCor)
+isde_DupCor=decideTests(fitDupCor,coef=1)
+plotMD(fitDupCor,coef=2,status = isde_DupCor[,2] )
+```
+
+```{r voom_reduced,warning=FALSE,message=FALSE,cache=cache_most}
+# normal model without ind
+fit_red=eBayes(lmFit(wg_voom,design))
+isde_red=decideTests(fit_red)
+summary(isde_red)
+plotMD(fit_red,coef=2,status = isde_red[,2])
+```
+
+```{r voom_full,warning=FALSE,message=FALSE, cache=cache_most}
+design2 = model.matrix(~ condition + ind,data=wg_filt$samples)
+wg_voom2 <- voom(wg_filt, design2 , plot = T)
+fit_full = eBayes(lmFit(wg_voom2,design2))
+isde_full=decideTests(fit_full)
+plotMD(fit_full,coef=2,status = isde_full[,2])
+summary(isde_full)
+```
+
+
+
+
+##  DREAM
+
+
+```{r dream_analysis,warning=FALSE,message=FALSE, cache=cache_special}
+param = SnowParam(6,"SOCK",progressbar = TRUE)
+register(param)
+form <- ~ condition  + (1|ind)
+wg_dream = voomWithDreamWeights(wg_filt,form,wg_filt$samples,plot=T)
+fit_dream = dream(wg_dream,form,wg_filt$samples)
+wg_dream2 = voomWithDreamWeights(wg_filt,form,wg_filt$samples)
+fit_dream2 = dream(wg_dream,form,wg_filt$samples,ddf="Kenward-Roger")
+```
+
+```{r var_part_analysis,warning=FALSE,message=FALSE, cache=cache_special}
+cl <- makeCluster(6)
+registerDoParallel(cl)
+getDoParWorkers()
+form <- ~ 1 + (1|condition) + (1|ind)
+varpart <- fitExtractVarPartModel(wg_dream,form,wg_filt$samples)
+```
+
+
+```{r var_part_plot,warning=FALSE,message=FALSE, cache=cache_most,fig.cap="Variance explained by cofactors (VarPart)"}
+plotVarPart(varpart)
+```
+
+#### Compare Satterthwaite vs. Kenward-Rodgers
+
+```{r ks_sw_plot,warning=FALSE,message=FALSE, cache=cache_most}
+plotCompareP_alt(fit_dream2$p.value[,2],fit_dream$p.value[,2],vpDonor = varpart$ind,dupcorvalue = dupcor$consensus.correlation,psize=1,
+                 xlabel="Dream, KR approx", ylabel="Dream, Sw approx")
+```
+
+```{r Glimma_ks_sw_plot, cache=cache_most}
+glXYPlot(-log10(fit_dream2$p.value[,2]), -log10(fit_dream$p.value[,2]), ylab = "Dream, Sw approx -log10(P)", xlab = "Dream, KR approx -log10(P)",
+         counts=cpm(wg_filt), transform = F,groups = wg_filt$samples$group, anno=wg_filt$genes[,c(1,4,5,6)], side.main = "Geneid", side.ylab = "CPM (TMM norm)", launch=FALSE,html = "wg_dream_KR_S_comp" )
+```
+
+[Dynamic comparison  plot](./glimma-plots/wg_dream_KR_S_comp.html)
+
+Kenward-Rodgers does not seem to cope well with low variance/zero counts in one condition:
+
+```{r ks_sw_plot_low_expr,warning=FALSE,message=FALSE, cache=cache_most}
+one_cond_low = apply(wg_filt$counts,1,function(x) median(x[wg_filt$samples$group == "CD2+"]) <= 3  | median(x[wg_filt$samples$group == "CD2-"]) <= 3  )
+p1 <- ggplot(data = data.frame(KS=-log10(fit_dream2$p.value[,2]),Sw=-log10(fit_dream$p.value[,2]),one_cond_low=one_cond_low),aes(x=KS,y=Sw,col=one_cond_low))  + geom_point(size=1) + geom_abline(color="black",linetype="dashed") + theme(legend.position="none")
+p2 <- ggplot(data = data.frame(logP=-log10(fit_dream2$p.value[,2]),logFC=fit_dream$coefficients[,2],one_cond_low=one_cond_low),aes(x=logFC,y=logP,col=one_cond_low)) + geom_point(size=1) + ggtitle("Kenward-Rodgers approximation")  + geom_hline(yintercept = -log10(0.05),color="black",linetype="dashed")
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## Compare Different Results to each other
+
+#### Compare Full vs Reduced vs DupCor
+
+```{r compare_full_reduced_dupcor_plot,warning=FALSE,message=FALSE, cache=cache_most,fig.width=12}
+layout_matrix <- matrix(c(4,1, 1,4, 2, 2, 3, 3), nrow = 2, byrow = TRUE)
+p1 <- plotCompareP_alt(fit_full$p.value[,2],fit_red$p.value[,2],psize=1,xlabel="full model", ylabel="only cond.",adjust = T,vpDonor = varpart$ind,dupcorvalue = 0.5)
+p2 <- plotCompareP_alt(fit_full$p.value[,2],fitDupCor$p.value[,2],psize=1,xlabel="full model", ylabel="Dupcor",adjust = T,vpDonor = varpart$ind,dupcorvalue = 0.5)
+p3 <- plotCompareP_alt(fit_red$p.value[,2],fitDupCor$p.value[,2],psize=1,xlabel="only cond.", ylabel="Dupcor",adjust = T,vpDonor = varpart$ind,dupcorvalue = 0.5)
+grid.arrange(p1,p2,p3,layout_matrix=layout_matrix)
+```
+
+### EdgeR vs Limma vs DupCor
+ 
+```{r edgeR_limma_dupcor,warning=FALSE,message=FALSE, cache=cache_most}
+p1 <- plotCompareP_alt(ql_lrt$table$PValue,fit_full$p.value[,2],vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="EdgeR, full", ylabel="Limma, full")
+p2 <- plotCompareP_alt(ql_lrt2$table$PValue,fit_full$p.value[,2],vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="EdgeR, reduced model", ylabel="Limma, full")
+p3 <- plotCompareP_alt(ql_lrt$table$PValue,fitDupCor$p.value[,2],vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="EdgeR, reduced model", ylabel="Limma, Dupcor")
+p4 <- plotCompareP_alt(ql_lrt2$table$PValue,fitDupCor$p.value[,2],vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="EdgeR, reduced model", ylabel="Limma, Dupcor")
+ggarrange(p1,p2,p3,p4,common.legend = TRUE, legend="bottom")
+```
+
+
+### Dream v Limma v LimmaDupcor
+
+
+```{r dream_limma_dupcor_edgeR,warning=FALSE,message=FALSE, cache=cache_most}
+p1 <- plotCompareP_alt(fit_dream$p.value[,2],fit_full$p.value[,2],vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="Dream", ylabel="Limma, full")
+p2 <- plotCompareP_alt(fit_dream$p.value[,2],fitDupCor$p.value[,2],vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="Dream", ylabel="Limma, DupCor")
+p3 <- plotCompareP_alt(fit_dream$p.value[,2],ql_lrt$table$PValue,vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="Dream", ylabel="EdgeR, full")
+p4 <- plotCompareP_alt(fit_dream$p.value[,2],ql_lrt2$table$PValue,vpDonor = varpart$ind,dupcorvalue = 0.5,psize=1,
+                 xlabel="Dream", ylabel="EdgeR, reduced")
+ggarrange(p1,p2,p3,p4,common.legend = TRUE, legend="bottom")
+```
+```{r res_table,warning=FALSE,message=FALSE, cache=cache_most, results="asis"}
+knitr::kable(cbind("ER full"=summary(decideTests(ql_lrt))[,1],"ER reduced"=summary(decideTests(ql_lrt2))[,1],"Limma, full"=summary(decideTests(fit_full))[,2],"Limma, red"=summary(decideTests(fit_red))[,2],"Limma, DupCor"=summary(decideTests(fitDupCor))[,2], "Dream"=summary(decideTests(fit_dream))[,2] ))
+```
+
+### Overlapping significant genes
+
+```{r diff_de_plot,warning=FALSE,message=FALSE, cache=cache_most}
+dt_all <-cbind("ER full"=decideTests(ql_lrt)[,1],"ER reduced"=decideTests(ql_lrt2)[,1],"Limma, full"=decideTests(fit_full)[,2],"Limma, red"=decideTests(fit_red)[,2],"Limma, DupCor"=decideTests(fitDupCor)[,2], "Dream"=decideTests(fit_dream)[,2] )
+dt_setdiff=matrix(0,nrow=ncol(dt_all),ncol=ncol(dt_all))
+colnames(dt_setdiff)=colnames(dt_all)
+rownames(dt_setdiff)=colnames(dt_all)
+for(i in colnames(dt_all)){
+  for(j in colnames(dt_all)){
+    dt_setdiff[i,j] <- sum(dt_all[, i] != dt_all[, j])/sum(dt_all[, i] != 0)
+  }
+}
+pheatmap(100 * dt_setdiff,clustering_distance_rows=as.dist(dt_setdiff),clustering_distance_cols=as.dist(dt_setdiff), main="% diff. in DE genes")
+```
+
+### Comparing MA Plots
+
+Glimma and Degust
+
+```{r Glimma_plot_MD_full,cache=TRUE}
+glMDPlot(fit_full, coef = 2, counts=cpm(wg_filt$counts),anno=wg_filt$genes,groups=wg_filt$samples$condition,status=isde_full[,2],
+         main="MD Plot limma voom, cond + ind",display.columns = c("Geneid","gene_biotype","external_gene_name","entrezgene_id","description") , 
+         side.main = "Geneid", side.ylab = "Expression (CPM)", html="wg_limma_full_MD_plot", launch=FALSE)
+glMDPlot(ql_lrt, counts=cpm(wg_filt$counts),anno=wg_filt$genes,groups=wg_filt$samples$condition,status=decideTests(ql_lrt),main="MD Plot edgeR, cond + ind",
+         display.columns = c("Geneid","gene_biotype","external_gene_name","entrezgene_id","description") , side.main = "Geneid", transform=F,side.ylab = "Expression (CPM)", html="wg_edger_full_MD_plot",launch=FALSE)
+```
+
+[Dynamic version of edger MD plot](./glimma-plots/wg_edger_full_MD_plot.html)
+[Dynamic version of Limma MD plot](./glimma-plots/wg_limma_full_MD_plot.html)
+
+The Average CPM and logCPM differ between the analysis as Limma/voom uses the average over the logCPMs, while EdgeR does the log(avg(CPM)) amongst other magic (prior count and something else) .... a bit vexing
+
+# Results for Limma full model (condition and indiviudal as effects)
+
+## Create results table
+
+* use Limma Voom full
+* Should contain additional FCs and CPMs for PMA
+  + exvivo CD 2+ : PMA CD2+ = Pool.1 : Pool.4
+  + exvivo CD 2- : PMA CD2- = Pool.5 : Pool.8
+  + medium CD 2+ : PMA CD2+ = Pool2 : Pool.4
+  + medium CD 2- : PMA CD2- = Pool.6 : Pool.8
+
+
+```{r create_results_table,cache=TRUE}
+
+samples=grep("Pool.[1,2,4,5,6,8]",colnames(wg),value = T)
+pools = wg[wg$Geneid %in% rownames(wg_filt$counts) , c("Geneid",samples)]
+rownames(pools) = pools$Geneid
+pools$Geneid = NULL
+colnames(pools) = sub("_S.*","",samples,perl=T)
+pools = pools[rownames(wg_filt$counts),]
+ssheet_all = data.frame(sample=colnames(pools),condition=c("pCD2+","pCD2+,med","pCD2+,PMA","pCD2-","pCD2-,med","pCD2-,PMA"),ind="pool")
+ssheet_all=rbind(sample.sheet,ssheet_all) 
+# create the final 
+wg_all= cbind(wg_filt$counts,pools)
+wg_all = DGEList(wg_all,samples = ssheet_all, genes = wg_filt$genes)
+wg_all = calcNormFactors(wg_all)
+wg_all$samples$group = wg_all$samples$condition
+# calculate logFC
+all_lcpm=as.data.frame(cpm(wg_all,log = T,norm = T))
+all_cpm = as.data.frame(cpm(wg_all,log = F,norm = T))
+all_rpkm = as.data.frame(rpkm(wg_all,gene.length = "Length",log = F,normalized.lib.sizes = T))
+colnames(all_rpkm) = paste("RPKM",colnames(all_rpkm),sep="_")
+rownames(all_cpm)=rownames(pools)
+rownames(all_lcpm)=rownames(pools)
+all_lgfc =data.frame(lgFC_CD2p_ev_PMA = (all_lcpm$Pool.4 - all_lcpm$Pool.1), lgFC_CD2p_med_PMA = (all_lcpm$Pool.4 - all_lcpm$Pool.2),
+                     lgFC_CD2m_ev_PMA = (all_lcpm$Pool.8 - all_lcpm$Pool.5),  lgFC_CD2m_med_PMA = (all_lcpm$Pool.8 - all_lcpm$Pool.6))
+rownames(all_lgfc)=rownames(pools)
+tt_full=topTable(fit_full,coef=2,n=Inf)
+tt_full=cbind(tt_full,all_lgfc[rownames(tt_full),],all_cpm[rownames(tt_full),],all_rpkm[rownames(tt_full),])
+# for degust:
+tt_output = tt_full
+colnames(tt_output) = c("Geneid","Chr","Length","gene_biotype","external_gene_name","entrezgene_id","description","logFC","AveExpr","t",
+                      "P.Value","adj.P.Val","B","CD2+ev_PMA","CD2+med_PMA","CD2-ev_PMA","CD2-med_PMA",
+                      "A0C1","A0C5","A1C1","A1C5","A2C1","A2C5","A3C1","A3C5","A4C1","A4C5","A5C1","A5C5",
+                      "Pool.1","Pool.2","Pool.4","Pool.5","Pool.6","Pool.8","RPKM_A0C1","RPKM_A0C5","RPKM_A1C1","RPKM_A1C5","RPKM_A2C1",
+                      "RPKM_A2C5","RPKM_A3C1","RPKM_A3C5","RPKM_A4C1","RPKM_A4C5","RPKM_A5C1","RPKM_A5C5",
+                      "RPKM_Pool.1","RPKM_Pool.2","RPKM_Pool.4","RPKM_Pool.5","RPKM_Pool.6","RPKM_Pool.8")
+tt_output$CD2p = 0
+write.csv(tt_output,file = "wg_limma_full_all.csv",row.names = F)
+rm(tt_output)
+```
+
+### Degust plot (interactive, not very userfriendly)
+
+```{bash create_degust_file}
+python2 ~/Downloads/degust.py -o wg_limma_full_all_degust.html --name wg_limma_full --primary "CD2p" --avg "AveExpr"  --fdr "adj.P.Val" --link-url "http://www.ensembl.org/id/%s" --info "Geneid","gene_biotype","external_gene_name","description" --logFC "logFC","CD2+ev_PMA","CD2+med_PMA","CD2-ev_PMA","CD2-med_PMA" --counts  "CD2p":"A0C1","A1C1","A2C1","A3C1","A4C1","A5C1" --counts "logFC":"A0C5","A1C5","A2C5","A3C5","A4C5","A5C5" --counts "CD2+ev_PMA":"Pool.1","Pool.4"  --counts  "CD2+med_PMA":"Pool.2","Pool.4" --counts "CD2-ev_PMA":"Pool.5","Pool.8" --counts "CD2-med_PMA":"Pool.6","Pool.8" wg_limma_full_all.csv
+
+```
+
+Some overview of expression data [Degust file](./wg_limma_full_all_degust.html)
+
+##  Glimma plots for interactive exploration
+
+```{r create_glimma_plots,cache=TRUE}
+x_tab=tt_full[,c("Geneid","Length", "gene_biotype", "external_gene_name", "entrezgene_id", "description","AveExpr","logFC","adj.P.Val","lgFC_CD2p_ev_PMA", "lgFC_CD2p_med_PMA", "lgFC_CD2m_ev_PMA", "lgFC_CD2m_med_PMA")]
+colnames(x_tab)  = c("Geneid","Len", "biotype", "Gene", "EntrezID", "Description","AveExpr","logFC","adj.P.Val","CD2p_PMA", "CD2p_med_PMA", "CD2m_PMA", "CD2m_med_PMA")
+annos_tab=x_tab[,c("Geneid","Len", "biotype", "Gene", "EntrezID", "Description","AveExpr","logFC","adj.P.Val","CD2p_PMA", "CD2p_med_PMA", "CD2m_PMA", "CD2m_med_PMA")]
+samp_glm=as.character(ssheet_all$sample)
+group_glm=as.character(ssheet_all$condition)
+count_mat=as.matrix(tt_full[,samp_glm])
+samp_cols=ssheet_all$condition
+sig_tab=(tt_full$adj.P.Val <= 0.05) * sign(tt_full$logFC)
+disp_cols=c("Geneid", "biotype", "Gene", "EntrezID", "Description","adj.P.Val","logFC","CD2p_PMA", "CD2p_med_PMA", "CD2m_PMA", "CD2m_med_PMA")
+# MD plot
+glMDPlot(x=x_tab,xval="AveExpr",yval="logFC", counts=count_mat, anno=annos_tab, display.columns = disp_cols, samples=samp_glm, groups = group_glm,
+         transform = FALSE, side.main = "Geneid", status = sig_tab, folder = "glimma-plots", html = "WG_MD-Plot", launch = FALSE, sample.cols = samp_cols,
+         side.ylab = "TMM normalised Expression (CPM)")
+# Vulcanoplot
+glXYPlot(x=x_tab$logFC,y=-log10(x_tab$adj.P.Val),xlab="logFC",ylab="-log10(P)", counts=count_mat, anno=annos_tab, display.columns = disp_cols, samples=samp_glm, groups = group_glm,
+         transform = FALSE, side.main = "Geneid", status = sig_tab, folder = "glimma-plots", html = "WG_Vulcano-Plot", launch = FALSE, 
+         sample.cols = samp_cols, side.ylab = "TMM normalised Expression (CPM)")
+
+#glXYPlot(x=x_tab$AveExpr,y=x_tab$logFC,xlab="AveExpr",ylab="logFC", counts=count_mat, anno=annos_tab, display.columns = disp_cols, samples=samp_glm, groups = group_glm,
+#         transform = FALSE, side.main = "Geneid", status = sig_tab, folder = "glimma-plots", html = "WG_MD-Plot_test", launch = TRUE, sample.cols = samp_cols)
+```
+[Interactive MDS plot](./glimma-plots/WG_MD-Plot.html)
+
+[Interactive Vulcano plot](./glimma-plots/WG_Vulcano-Plot.html)
+
+## Save as excel sheet
+
+```{r export_table}
+tt_full$CD2p = NULL
+decT=decideTests(fit_full,adjust.method="BH",method="separate")
+decT=decT[,2]
+regul.df=as.data.frame(table(decT))
+colnames(regul.df)<-c("Regulation", "Genes")
+regul.df$Regulation <- c("down","-","up")
+tt_full$B = NULL
+tt_full = tt_full[,c("Geneid","Chr","Length","gene_biotype","external_gene_name","logFC","adj.P.Val","entrezgene_id","description","AveExpr","t",
+                     "P.Value","lgFC_CD2p_ev_PMA","lgFC_CD2p_med_PMA","lgFC_CD2m_ev_PMA","lgFC_CD2m_med_PMA","A0C1","A0C5","A1C1","A1C5","A2C1",
+                     "A2C5","A3C1","A3C5","A4C1","A4C5","A5C1","A5C5","Pool.1","Pool.2","Pool.4","Pool.5","Pool.6","Pool.8",
+                     "RPKM_A0C1","RPKM_A0C5","RPKM_A1C1","RPKM_A1C5","RPKM_A2C1","RPKM_A2C5","RPKM_A3C1","RPKM_A3C5","RPKM_A4C1","RPKM_A4C5",
+                     "RPKM_A5C1","RPKM_A5C5","RPKM_Pool.1","RPKM_Pool.2","RPKM_Pool.4","RPKM_Pool.5","RPKM_Pool.6","RPKM_Pool.8")]
+signif = tt_full[tt_full$adj.P.Val <= 0.05,]
+xlsbname=paste("wg_genes_limma_full_raw.xls",sep="_")
+WriteXLS::WriteXLS(list(regul.df,signif,tt_full), ExcelFileName = paste0(xlsbname), SheetNames = c("Num. Signif","Signif. DE","All"), AdjWidth = TRUE, BoldHeaderRow = TRUE,FreezeRow = 1, FreezeCol = 7)
+
+```
+
+
+
+# Enrichment Analysis
+
+
+## Gather data and gene sets
+
+```{r get_gene_sets,cache=TRUE, eval = ERANAL}
+#msigdbr::msigdbr_show_species()
+m_h = msigdbr::msigdbr(species = "Sus scrofa",category = "H")
+m_tf = msigdbr::msigdbr(species = "Sus scrofa",category = "C3", subcategory = "TFT")
+m_immun = msigdbr::msigdbr(species = "Sus scrofa",category = "C7")
+h.gs = split(m_h$entrez_gene,m_h$gs_name, drop =TRUE)
+h.gs = lapply(h.gs,as.character)
+h.gs <- lapply(h.gs,unique)
+names(h.gs)=gsub("_","-",names(h.gs))
+tf.gs=lapply(split(m_tf$entrez_gene,m_tf$gs_name, drop =TRUE),as.character)
+tf.gs <- lapply(tf.gs,unique)
+names(tf.gs)=gsub("_","-",names(tf.gs))
+immun.gs=lapply(split(m_immun$entrez_gene,m_immun$gs_name, drop =TRUE),as.character)
+immun.gs <- lapply(immun.gs,unique)
+names(immun.gs)=gsub("_","-",names(immun.gs))
+
+library("EnrichmentBrowser")
+
+# idTypes("ssc")
+go.bp.gs <- getGenesets(org="ssc",db="go", go.onto="BP", go.mode="GO.db")
+go.mf.gs <- getGenesets(org="ssc",db="go", go.onto="MF", go.mode="GO.db")
+go.cc.gs <- getGenesets(org="ssc",db="go", go.onto="CC", go.mode="GO.db")
+
+kegg.gs <- getGenesets(org="ssc",db="kegg")
+
+```
+
+```{r make_seset,cache=TRUE, eval = ERANAL}
+keep_rows=! ( is.na(wg_filt$genes$entrezgene_id) | duplicated(wg_filt$genes$entrezgene_id) )
+featureData <- topTable(fit_full,coef=2,adjust.method="BH",number=Inf,sort.by="none")[,c("logFC","adj.P.Val","t")]
+colnames(featureData) = c("FC","ADJ.PVAL","limma.STAT")
+featureData = featureData[keep_rows,]
+rownames(featureData)=wg_filt$genes$entrezgene_id[keep_rows]
+featureData <- new("AnnotatedDataFrame", data=featureData)
+exprs=cpm(wg_filt,normalized.lib.sizes = T,log = T)[keep_rows,]
+rownames(exprs) = wg_filt$genes$entrezgene_id[keep_rows]
+pdata=as.data.frame(wg_filt$samples)
+colnames(pdata)[1:3]=c("GROUP","lib.size","norm.factors")
+pdata = new("AnnotatedDataFrame", data=pdata)
+eset<-ExpressionSet(assayData=exprs, featureData = featureData, phenoData = pdata,annotation="ssc",dataType="rseq")
+seset <- as(eset, "SummarizedExperiment")
+
+```
+
+```{r make_seset_all,cache=TRUE, eval = ERANAL}
+keep_rows=! ( is.na(wg_all$genes$entrezgene_id) | duplicated(wg_all$genes$entrezgene_id) )
+featureData <- topTable(fit_full,coef=2,adjust.method="BH",number=Inf,sort.by="none")[,c("logFC","adj.P.Val","t")]
+colnames(featureData) = c("FC","ADJ.PVAL","limma.STAT")
+featureData = featureData[keep_rows,]
+rownames(featureData)=wg_all$genes$entrezgene_id[keep_rows]
+featureData <- new("AnnotatedDataFrame", data=featureData)
+exprs=cpm(wg_all,normalized.lib.sizes = T,log = T)[keep_rows,]
+rownames(exprs) = wg_all$genes$entrezgene_id[keep_rows]
+pdata=as.data.frame(wg_all$samples)
+colnames(pdata)[1:3]=c("GROUP","lib.size","norm.factors")
+pdata = new("AnnotatedDataFrame", data=pdata)
+eset<-ExpressionSet(assayData=exprs, featureData = featureData, phenoData = pdata,annotation="ssc",dataType="rseq")
+seset_all <- as(eset, "SummarizedExperiment")
+```
+
+
+## Run enrichment analysis:
+
+```{r run_gs_enrichments,cache=TRUE,eval = ERANAL}
+library(fgsea)
+# ora for GO
+ora_go_bp=sbea(method="ora", se=seset, gs=go.bp.gs  , alpha = 0.05,perm = 0, padj.method = "BH")
+ora_go_mf=sbea(method="ora", se=seset, gs=go.mf.gs  , alpha = 0.05,perm = 0, padj.method = "BH")
+ora_go_cc=sbea(method="ora", se=seset, gs=go.cc.gs  , alpha = 0.05,perm = 0, padj.method = "BH")
+
+fgse_kegg <- sbea_fgse(seset,kegg.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+fgse_h <- sbea_fgse(seset,h.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+fgse_tf <- sbea_fgse(seset,tf.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+fgse_immun <- sbea_fgse(seset,immun.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+
+```
+
+```{r run_gs_enrichments_all,cache=TRUE, eval = ERANAL}
+library(fgsea)
+# ora for GO
+ora_go_bp_all=sbea(method="ora", se=seset_all, gs=go.bp.gs  , alpha = 0.05,perm = 0, padj.method = "BH")
+ora_go_mf_all=sbea(method="ora", se=seset_all, gs=go.mf.gs  , alpha = 0.05,perm = 0, padj.method = "BH")
+ora_go_cc_all=sbea(method="ora", se=seset_all, gs=go.cc.gs  , alpha = 0.05,perm = 0, padj.method = "BH")
+
+fgse_kegg_all <- sbea_fgse(seset_all,kegg.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+fgse_h_all <- sbea_fgse(seset_all,h.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+fgse_tf_all <- sbea_fgse(seset_all,tf.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+fgse_immun_all <- sbea_fgse(seset_all,immun.gs,alpha = 0.05,perm = 10000, padj.method = "none")
+
+```
+
+## Create EnrichmentBrowser output
+
+```{r reports_gs_enrichments,cache=TRUE, eval = ERANAL}
+configEBrowser(key="OUTDIR.DEFAULT", value=paste(getwd(),"EBrowser2",sep="/"))
+#library("EnrichmentBrowser")
+#library(GSEABase)
+source("rnaseq_funcs.R")
+eaBrowse(ora_go_bp, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/GO",sep="/"), report.name = "GO_BP")
+eaBrowse(ora_go_mf, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/GO",sep="/"), report.name = "GO_MF")
+eaBrowse(ora_go_cc, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/GO",sep="/"), report.name = "GO_CC")
+#source("rnaseq_funcs.R")
+eaBrowse_alt(fgse_kegg, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/KEGG/",sep="/"), report.name = "KEGG")
+eaBrowse_alt(fgse_h, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/MSIG_HALLMARK/",sep="/"), report.name = "HALLMARK")
+eaBrowse_alt(fgse_tf, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/MSIG_TF/",sep="/"), report.name = "TF")
+eaBrowse_alt(fgse_immun, html.only = TRUE,out.dir = paste(getwd(),"EBrowser2/MSIG_IMMUN/",sep="/"), report.name = "IMMUN")
+```
+
+[EB GO BP (biological process) analysis](./EBrowser2/GO/GO_BP.html)
+
+[EB GO MF (molecular function) analysis](./EBrowser2/GO/GO_MF.html)
+
+[EB GO CC (cellular component) analysis](./EBrowser2/GO/GO_CC.html)
+
+[EB KEGG analysis](./EBrowser2/KEGG/KEGG.html)
+
+[EB MSigDB Hallmark genes analysis](./EBrowser2/MSIG_HALLMARK/HALLMARK.html)
+
+[EB MSigDB Transcription Factor (C3 TF) analysis](./EBrowser2/MSIG_TF/TF.html)
+
+[EB MSigDB Immun signatures (C7) analysis](./EBrowser2/MSIG_IMMUN/IMMUN.html)
+
+### Create EB output including extra samples in Heatmap
+
+```{r reports_gs_enrichments_all,cache=TRUE,eval = ERANAL}
+configEBrowser(key="OUTDIR.DEFAULT", value=paste(getwd(),"EBrowser2",sep="/"))
+#library("EnrichmentBrowser")
+#library(GSEABase)
+source("rnaseq_funcs.R")
+eaBrowse(ora_go_bp_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/GO",sep="/"), report.name = "GO_BP")
+eaBrowse(ora_go_mf_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/GO",sep="/"), report.name = "GO_MF")
+eaBrowse(ora_go_cc_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/GO",sep="/"), report.name = "GO_CC")
+eaBrowse_alt(fgse_kegg_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/KEGG/",sep="/"), report.name = "KEGG")
+eaBrowse_alt(fgse_h_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/MSIG_HALLMARK/",sep="/"), report.name = "HALLMARK")
+eaBrowse_alt(fgse_tf_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/MSIG_TF/",sep="/"), report.name = "TF")
+eaBrowse_alt(fgse_immun_all, html.only = TRUE,out.dir = paste(getwd(),"EBrowser_all/MSIG_IMMUN/",sep="/"), report.name = "IMMUN")
+```
+
+
+These only have the pooled samples added to the heatmaps:
+
+
+[EB GO BP (biological process) analysis](./EBrowser_all/GO/GO_BP.html)
+
+[EB GO MF (molecular function) analysis](./EBrowser_all/GO/GO_MF.html)
+
+[EB GO CC (cellular component) analysis](./EBrowser_all/GO/GO_CC.html)
+
+[EB KEGG analysis](./EBrowser_all/KEGG/KEGG.html)
+
+[EB MSigDB Hallmark genes analysis](./EBrowser_all/MSIG_HALLMARK/HALLMARK.html)
+
+[EB MSigDB Transcription Factor (C3 TF) analysis](./EBrowser_all/MSIG_TF/TF.html)
+
+[EB MSigDB Immun signatures (C7) analysis](./EBrowser_all/MSIG_IMMUN/IMMUN.html)
+
+## Webgestalt output
+
+```{r webgestalt_gs_enrichments,cache=TRUE, eval = ERANAL}
+library(WebGestaltR)
+write.gmt(h.gs, "ss_msigdb_hallmark.gmt")
+write.gmt(tf.gs, "ss_msigdb_tf.gmt")
+write.gmt(immun.gs, "ss_msigdb_immun.gmt")
+
+dir.create("WG2")
+
+wg_ora = WebGestaltR(enrichMethod = "ORA",organism = "sscrofa", 
+                     enrichDatabase = "geneontology_Biological_Process_noRedundant", 
+                     interestGeneType = "ensembl_gene_id", interestGene = unlist(as.character(tt_full$Geneid[tt_prot$adj.P.Val <= 0.05])),
+                     referenceGeneType = "ensembl_gene_id", referenceGene = unlist(as.character(tt_full$Geneid)), outputDirectory="WG2")
+
+
+wg_ora = WebGestaltR(enrichMethod = "ORA", organism = "sscrofa", projectName = "GO_ORA_fdr_0.05",
+                     enrichDatabase = c("geneontology_Biological_Process","geneontology_Cellular_Component","geneontology_Molecular_Function"),
+                     interestGeneType = "ensembl_gene_id", interestGene = unlist(as.character(tt_full$Geneid[tt_full$adj.P.Val <= 0.05])),
+                     referenceGeneType = "ensembl_gene_id", referenceGene = unlist(as.character(tt_full$Geneid)), outputDirectory="WG2")
+wg_gsea = WebGestaltR(enrichMethod = "GSEA", organism = "sscrofa", projectName = "KEGG_GSEA", outputDirectory="WG2",
+                      enrichDatabase = c("pathway_KEGG"),
+                      interestGeneType = "ensembl_gene_id", interestGene = tt_full[,c("Geneid","t")], minNum = 10, maxNum = 500)
+
+
+wg_gsea_msigdb_H = WebGestaltR(enrichMethod = "GSEA", organism = "sscrofa", projectName = "_Hallmark_MSIGDB", outputDirectory="WG2",
+                             enrichDatabase = NULL, enrichDatabaseFile = "ss_msigdb_hallmark.gmt", enrichDatabaseType="entrezgene",
+                             interestGeneType = "ensembl_gene_id", interestGene = tt_full[,c("Geneid","t")], minNum = 10, maxNum = 500)
+wg_gsea_msigdb_TF = WebGestaltR(enrichMethod = "GSEA", organism = "sscrofa", projectName = "TFs_MSIGDB", outputDirectory="WG2",
+                             enrichDatabase = NULL, enrichDatabaseFile = "ss_msigdb_tf.gmt", enrichDatabaseType="entrezgene",
+                             interestGeneType = "ensembl_gene_id", interestGene = tt_full[,c("Geneid","t")], minNum = 10, maxNum = 1000, topThr = 25)
+
+wg_gsea_msigdb_Immun = WebGestaltR(enrichMethod = "GSEA", organism = "sscrofa", projectName = "Immun_MSIGDB", outputDirectory="WG2",
+                                enrichDatabase = NULL, enrichDatabaseFile = "ss_msigdb_immun.gmt", enrichDatabaseType="entrezgene",
+                                interestGeneType = "ensembl_gene_id", interestGene = tt_full[,c("Geneid","t")], minNum = 10, maxNum = 750)
+
+```
+
+[Webgestalt GO analysis](./WG2/Project_GO_ORA_fdr_0_05/Report_GO_ORA_fdr_0_05.html)
+
+[Webgestalt GO analysis](./WG2/Project_GO_ORA_fdr_0_05/Report_GO_ORA_fdr_0_05.html)
+
+[Webgestalt KEGG analysis](./WG2/Project_KEGG_GSEA/Report_KEGG_GSEA.html)
+
+
+[Webgestalt MSigDB Hallmark genes analysis](./WG2/Project__Hallmark_MSIGDB/Report__Hallmark_MSIGDB.html)
+
+[Webgestalt MSigDB Transcription Factor (C3 TF) analysis](./WG2/Project_TFs_MSIGDB/Report_TFs_MSIGDB.html)
+
+[Webgestalt MSigDB Immun signatures (C7) analysis](./WG2/Project_Immun_MSIGDB/Report_Immun_MSIGDB.html)
+
+
+```{bash zip_directory,eval=FALSE}
+ zip -r Gerner_Analysis.zip Gerner_RNASeq --exclude "*No_repl*" --exclude "*Sample*" --exclude "*ss*.gmt" --exclude "*gerner_rnaseq_analysis.R" --exclude "*gerner_rnaseq_analysis_cache*" --exclude "*gerner_rnaseq_analysis_files*" --exclude "*.RData" --exclude "*_raw.xls" --exclude "*.csv" --exclude "*Rhistory" --exclude "*lock*"
+```

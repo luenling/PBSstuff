@@ -1,0 +1,6 @@
+library(ChIPQC)
+setwd("~/Sambamba/")
+samples=read.csv("~/samples.black.csv", header=TRUE)
+experiment = ChIPQC(samples, annotation = "hg19")
+setwd("~/Sambamba/")
+ChIPQCreport(experiment)
